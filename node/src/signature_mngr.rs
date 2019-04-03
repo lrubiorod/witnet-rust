@@ -7,9 +7,17 @@ use actix::prelude::*;
 use failure;
 use failure::bail;
 use futures::future::Future;
+use log;
 
-use witnet_crypto::{key::SK, signature};
-use witnet_data_structures::chain::{Hash, Hashable};
+use crate::{actors::storage_keys::EXTENDED_SK_KEY, storage_mngr};
+
+use witnet_crypto::{
+    key::{ExtendedSK, MasterKeyGen, SK},
+    mnemonic::MnemonicGen,
+    signature,
+};
+
+use witnet_data_structures::chain::{ExtendedSecretKey, Hash, Hashable};
 
 /// Start the signature manager
 pub fn start() {
@@ -48,11 +56,72 @@ struct SignatureManager {
 struct SetKey(SK);
 struct Sign(Vec<u8>);
 
+/// Auxiliary methods for SignatureManager actor
+impl SignatureManager {
+    /// Method to persist the extended secret key into storage
+    fn persist_extended_sk(&self, ctx: &mut Context<Self>, extended_sk: ExtendedSK) {
+        let extended_secret_key = ExtendedSecretKey::from(extended_sk);
+
+        storage_mngr::put(&EXTENDED_SK_KEY, &extended_secret_key)
+            .into_actor(self)
+            .and_then(|_, _, _| {
+                log::debug!("Successfully persisted the extended secret key into storage");
+                fut::ok(())
+            })
+            .map_err(|err, _, _| {
+                log::error!(
+                    "Failed to persist the extended secret key into storage: {}",
+                    err
+                )
+            })
+            .spawn(ctx);
+    }
+}
+
 impl Actor for SignatureManager {
     type Context = Context<Self>;
 
-    fn started(&mut self, _ctx: &mut Self::Context) {
+    fn started(&mut self, ctx: &mut Self::Context) {
         log::debug!("Signature Manager actor has been started!");
+
+        storage_mngr::get::<_, ExtendedSecretKey>(&EXTENDED_SK_KEY)
+            .into_actor(self)
+            .map_err(|e, _, _| {
+                log::error!(
+                    "Error while getting the extended secret key from storage: {}",
+                    e
+                )
+            })
+            .and_then(move |extended_sk_from_storage, act, ctx| {
+                extended_sk_from_storage.map_or_else(
+                    || {
+                        log::warn!("No extended secret key in storage");
+
+                        // Create a new Secret Key
+                        let mnemonic = MnemonicGen::new().generate();
+                        // TODO: Seed words must be saved?
+                        let _words: Vec<&str> = mnemonic.words().split_whitespace().collect();
+                        let seed = mnemonic.seed("");
+
+                        match MasterKeyGen::new(seed).generate() {
+                            Ok(extended_sk) => {
+                                set_key(extended_sk.secret_key);
+
+                                act.persist_extended_sk(ctx, extended_sk);
+                            }
+                            Err(e) => log::warn!("{}", e),
+                        }
+                    },
+                    |extended_secret_key| {
+                        log::debug!("Secret key load and set");
+                        let extended_sk: ExtendedSK = extended_secret_key.into();
+                        set_key(extended_sk.secret_key);
+                    },
+                );
+
+                fut::ok(())
+            })
+            .spawn(ctx);
     }
 }
 
