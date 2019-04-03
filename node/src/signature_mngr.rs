@@ -56,26 +56,12 @@ struct SignatureManager {
 struct SetKey(SK);
 struct Sign(Vec<u8>);
 
-/// Auxiliary methods for SignatureManager actor
-impl SignatureManager {
-    /// Method to persist the extended secret key into storage
-    fn persist_extended_sk(&self, ctx: &mut Context<Self>, extended_sk: ExtendedSK) {
-        let extended_secret_key = ExtendedSecretKey::from(extended_sk);
+fn persist_extended_sk(extended_sk: ExtendedSK) -> impl Future<Item = (), Error = failure::Error> {
+    let extended_secret_key = ExtendedSecretKey::from(extended_sk);
 
-        storage_mngr::put(&EXTENDED_SK_KEY, &extended_secret_key)
-            .into_actor(self)
-            .and_then(|_, _, _| {
-                log::debug!("Successfully persisted the extended secret key into storage");
-                fut::ok(())
-            })
-            .map_err(|err, _, _| {
-                log::error!(
-                    "Failed to persist the extended secret key into storage: {}",
-                    err
-                )
-            })
-            .spawn(ctx);
-    }
+    storage_mngr::put(&EXTENDED_SK_KEY, &extended_secret_key).inspect(|_| {
+        log::debug!("Successfully persisted the extended secret key into storage");
+    })
 }
 
 impl Actor for SignatureManager {
@@ -85,43 +71,41 @@ impl Actor for SignatureManager {
         log::debug!("Signature Manager actor has been started!");
 
         storage_mngr::get::<_, ExtendedSecretKey>(&EXTENDED_SK_KEY)
-            .into_actor(self)
-            .map_err(|e, _, _| {
-                log::error!(
-                    "Error while getting the extended secret key from storage: {}",
-                    e
-                )
-            })
-            .and_then(move |extended_sk_from_storage, act, ctx| {
+            .and_then(move |extended_sk_from_storage| {
                 extended_sk_from_storage.map_or_else(
-                    || {
+                    || -> Box<dyn Future<Item = (), Error = failure::Error>> {
                         log::warn!("No extended secret key in storage");
 
                         // Create a new Secret Key
                         let mnemonic = MnemonicGen::new().generate();
-                        // TODO: Seed words must be saved?
-                        let _words: Vec<&str> = mnemonic.words().split_whitespace().collect();
                         let seed = mnemonic.seed("");
 
                         match MasterKeyGen::new(seed).generate() {
                             Ok(extended_sk) => {
-                                set_key(extended_sk.secret_key);
+                                let fut = set_key(extended_sk.secret_key)
+                                    .join(persist_extended_sk(extended_sk))
+                                    .map(|_| ());
 
-                                act.persist_extended_sk(ctx, extended_sk);
+                                Box::new(fut)
                             }
-                            Err(e) => log::warn!("{}", e),
+                            Err(e) => {
+                                let fut = futures::future::err(e.into());
+
+                                Box::new(fut)
+                            }
                         }
                     },
                     |extended_secret_key| {
-                        log::debug!("Secret key load and set");
                         let extended_sk: ExtendedSK = extended_secret_key.into();
-                        set_key(extended_sk.secret_key);
-                    },
-                );
+                        let fut = set_key(extended_sk.secret_key);
 
-                fut::ok(())
+                        Box::new(fut)
+                    },
+                )
             })
-            .spawn(ctx);
+            .map_err(|e| log::error!("Couldn't initialize Signature Manager: {}", e))
+            .into_actor(self)
+            .wait(ctx);
     }
 }
 
