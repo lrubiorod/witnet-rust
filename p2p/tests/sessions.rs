@@ -559,6 +559,7 @@ fn p2p_sessions_register_more_than_limit() {
 fn p2p_peer_address_is_similar_to_inbound_session() {
     // Create sessions struct
     let mut sessions = Sessions::<String>::default();
+    sessions.inbound_network_ranges.set_range_limit(14);
 
     let inbound_address_1 = "127.0.0.1:8002".parse().unwrap();
     let inbound_address_2 = "127.0.0.1:8003".parse().unwrap();
